@@ -5,7 +5,8 @@ use std::path::Path;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    pub discord: DiscordConfig,
+    pub discord: Option<DiscordConfig>,
+    pub slack: Option<SlackConfig>,
     pub agent: AgentConfig,
     #[serde(default)]
     pub pool: PoolConfig,
@@ -44,6 +45,16 @@ fn default_stt_base_url() -> String { "https://api.groq.com/openai/v1".into() }
 #[derive(Debug, Deserialize)]
 pub struct DiscordConfig {
     pub bot_token: String,
+    #[serde(default)]
+    pub allowed_channels: Vec<String>,
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SlackConfig {
+    pub bot_token: String,
+    pub app_token: String,
     #[serde(default)]
     pub allowed_channels: Vec<String>,
     #[serde(default)]

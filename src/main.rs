@@ -1,16 +1,19 @@
 mod acp;
+mod adapter;
 mod config;
 mod discord;
 mod error_display;
 mod format;
 mod reactions;
+mod slack;
 mod stt;
 
+use adapter::AdapterRouter;
 use serenity::prelude::*;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{error, info};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -30,20 +33,20 @@ async fn main() -> anyhow::Result<()> {
     info!(
         agent_cmd = %cfg.agent.command,
         pool_max = cfg.pool.max_sessions,
-        channels = ?cfg.discord.allowed_channels,
-        users = ?cfg.discord.allowed_users,
+        discord = cfg.discord.is_some(),
+        slack = cfg.slack.is_some(),
         reactions = cfg.reactions.enabled,
         "config loaded"
     );
 
+    if cfg.discord.is_none() && cfg.slack.is_none() {
+        anyhow::bail!("no adapter configured — add [discord] and/or [slack] to config.toml");
+    }
+
     let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions));
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
 
-    let allowed_channels = parse_id_set(&cfg.discord.allowed_channels, "allowed_channels")?;
-    let allowed_users = parse_id_set(&cfg.discord.allowed_users, "allowed_users")?;
-    info!(channels = allowed_channels.len(), users = allowed_users.len(), "parsed allowlists");
-
-    // Resolve STT config before constructing handler (auto-detect mutates cfg.stt)
+    // Resolve STT config (auto-detect GROQ_API_KEY from env)
     if cfg.stt.enabled {
         if cfg.stt.api_key.is_empty() && cfg.stt.base_url.contains("groq.com") {
             if let Ok(key) = std::env::var("GROQ_API_KEY") {
@@ -59,21 +62,7 @@ async fn main() -> anyhow::Result<()> {
         info!(model = %cfg.stt.model, base_url = %cfg.stt.base_url, "STT enabled");
     }
 
-    let handler = discord::Handler {
-        pool: pool.clone(),
-        allowed_channels,
-        allowed_users,
-        reactions_config: cfg.reactions,
-        stt_config: cfg.stt.clone(),
-    };
-
-    let intents = GatewayIntents::GUILD_MESSAGES
-        | GatewayIntents::MESSAGE_CONTENT
-        | GatewayIntents::GUILDS;
-
-    let mut client = Client::builder(&cfg.discord.bot_token, intents)
-        .event_handler(handler)
-        .await?;
+    let router = Arc::new(AdapterRouter::new(pool.clone(), cfg.reactions));
 
     // Spawn cleanup task
     let cleanup_pool = pool.clone();
@@ -84,20 +73,80 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Run bot until SIGINT/SIGTERM
-    let shard_manager = client.shard_manager.clone();
-    let shutdown_pool = pool.clone();
-    tokio::spawn(async move {
+    // Spawn Slack adapter (background task)
+    let slack_handle = if let Some(slack_cfg) = cfg.slack {
+        info!(
+            channels = slack_cfg.allowed_channels.len(),
+            users = slack_cfg.allowed_users.len(),
+            "starting slack adapter"
+        );
+        let router = router.clone();
+        Some(tokio::spawn(async move {
+            if let Err(e) = slack::run_slack_adapter(
+                slack_cfg.bot_token,
+                slack_cfg.app_token,
+                slack_cfg.allowed_channels.into_iter().collect(),
+                slack_cfg.allowed_users.into_iter().collect(),
+                router,
+            )
+            .await
+            {
+                error!("slack adapter error: {e}");
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Run Discord adapter (foreground, blocking) or wait for ctrl_c
+    if let Some(discord_cfg) = cfg.discord {
+        let allowed_channels =
+            parse_id_set(&discord_cfg.allowed_channels, "discord.allowed_channels")?;
+        let allowed_users = parse_id_set(&discord_cfg.allowed_users, "discord.allowed_users")?;
+        info!(
+            channels = allowed_channels.len(),
+            users = allowed_users.len(),
+            "starting discord adapter"
+        );
+
+        let handler = discord::Handler {
+            router,
+            allowed_channels,
+            allowed_users,
+            stt_config: cfg.stt.clone(),
+        };
+
+        let intents = GatewayIntents::GUILD_MESSAGES
+            | GatewayIntents::MESSAGE_CONTENT
+            | GatewayIntents::GUILDS;
+
+        let mut client = Client::builder(&discord_cfg.bot_token, intents)
+            .event_handler(handler)
+            .await?;
+
+        // Graceful Discord shutdown on ctrl_c
+        let shard_manager = client.shard_manager.clone();
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            info!("shutdown signal received");
+            shard_manager.shutdown_all().await;
+        });
+
+        info!("discord bot running");
+        client.start().await?;
+    } else {
+        // No Discord — just wait for ctrl_c
+        info!("running without discord, press ctrl+c to stop");
         tokio::signal::ctrl_c().await.ok();
         info!("shutdown signal received");
-        shard_manager.shutdown_all().await;
-    });
-
-    info!("starting discord bot");
-    client.start().await?;
+    }
 
     // Cleanup
     cleanup_handle.abort();
+    if let Some(handle) = slack_handle {
+        handle.abort();
+    }
+    let shutdown_pool = pool;
     shutdown_pool.shutdown().await;
     info!("openab shut down");
     Ok(())
@@ -115,7 +164,9 @@ fn parse_id_set(raw: &[String], label: &str) -> anyhow::Result<HashSet<u64>> {
         })
         .collect();
     if !raw.is_empty() && set.is_empty() {
-        anyhow::bail!("all {label} entries failed to parse — refusing to start with an empty allowlist");
+        anyhow::bail!(
+            "all {label} entries failed to parse — refusing to start with an empty allowlist"
+        );
     }
     Ok(set)
 }
