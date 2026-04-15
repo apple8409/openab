@@ -24,6 +24,9 @@ Agents deployed:
 {{- else if eq $cfg.command "gemini" }}
     Authenticate:
     kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- gemini
+{{- else if eq $cfg.command "opencode" }}
+    Authenticate:
+    kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- opencode auth login
 {{- end }}
 
     Restart after auth:
