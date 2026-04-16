@@ -155,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
                     users = allowed_users.len(),
                     trusted_bots = trusted_bot_ids.len(),
                     allow_bot_messages = ?discord_cfg.allow_bot_messages,
+                    allow_user_messages = ?discord_cfg.allow_user_messages,
                     "starting discord adapter"
                 );
 
@@ -166,6 +167,9 @@ async fn main() -> anyhow::Result<()> {
                     adapter: std::sync::OnceLock::new(),
                     allow_bot_messages: discord_cfg.allow_bot_messages,
                     trusted_bot_ids,
+                    allow_user_messages: discord_cfg.allow_user_messages,
+                    participated_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                    session_ttl: std::time::Duration::from_secs(ttl_secs),
                 };
 
                 let intents = GatewayIntents::GUILD_MESSAGES

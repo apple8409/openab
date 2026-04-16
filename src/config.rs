@@ -86,6 +86,8 @@ pub struct DiscordConfig {
     /// ignored when `"off"` since all bot messages are rejected before this check.
     #[serde(default)]
     pub trusted_bot_ids: Vec<String>,
+    #[serde(default)]
+    pub allow_user_messages: AllowUsers,
 }
 
 /// Controls whether the bot responds to user messages in threads without @mention.

@@ -1,6 +1,6 @@
 use crate::acp::ContentBlock;
 use crate::adapter::{AdapterRouter, ChatAdapter, ChannelRef, MessageRef, SenderContext};
-use crate::config::{AllowBots, SttConfig};
+use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::format;
 use crate::media;
 use async_trait::async_trait;
@@ -12,13 +12,16 @@ use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::model::user::User;
 use serenity::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, error, info};
 
 /// Hard cap on consecutive bot messages in a channel or thread.
 /// Prevents runaway loops between multiple bots in "all" mode.
 const MAX_CONSECUTIVE_BOT_TURNS: u8 = 10;
+
+/// Maximum entries in the participation cache before eviction.
+const PARTICIPATION_CACHE_MAX: usize = 1000;
 
 // --- DiscordAdapter: implements ChatAdapter for Discord via serenity ---
 
@@ -124,6 +127,74 @@ pub struct Handler {
     pub adapter: OnceLock<Arc<dyn ChatAdapter>>,
     pub allow_bot_messages: AllowBots,
     pub trusted_bot_ids: HashSet<u64>,
+    pub allow_user_messages: AllowUsers,
+    /// Positive-only cache: thread channel_id → cached_at for threads where bot has participated.
+    pub participated_threads: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
+    /// TTL for participation cache entries (from pool.session_ttl_hours).
+    pub session_ttl: std::time::Duration,
+}
+
+impl Handler {
+    /// Check if the bot has participated in a Discord thread.
+    /// Returns true if any message in the thread is from the bot.
+    /// Fail-closed: returns false on API error.
+    /// Only caches positive results (participation is irreversible).
+    async fn bot_participated_in_thread(
+        &self,
+        http: &Http,
+        channel_id: ChannelId,
+        bot_id: UserId,
+    ) -> bool {
+        let key = channel_id.to_string();
+
+        // Check positive cache
+        {
+            let cache = self.participated_threads.lock().await;
+            if let Some(cached_at) = cache.get(&key) {
+                if cached_at.elapsed() < self.session_ttl {
+                    return true;
+                }
+            }
+        }
+
+        // Fetch recent messages and check if bot posted any
+        let messages = match channel_id
+            .messages(http, serenity::builder::GetMessages::new().limit(200))
+            .await
+        {
+            Ok(msgs) => msgs,
+            Err(e) => {
+                tracing::warn!(
+                    channel_id = %channel_id,
+                    error = %e,
+                    "failed to fetch thread messages for participation check, rejecting (fail-closed)"
+                );
+                return false;
+            }
+        };
+
+        let involved = messages.iter().any(|m| m.author.id == bot_id);
+
+        if involved {
+            let mut cache = self.participated_threads.lock().await;
+            cache.insert(key, tokio::time::Instant::now());
+
+            // Evict if over capacity
+            if cache.len() > PARTICIPATION_CACHE_MAX {
+                cache.retain(|_, ts| ts.elapsed() < self.session_ttl);
+                if cache.len() > PARTICIPATION_CACHE_MAX {
+                    let mut entries: Vec<_> = cache.iter().map(|(k, v)| (k.clone(), *v)).collect();
+                    entries.sort_by_key(|(_, ts)| *ts);
+                    let evict_count = entries.len() / 2;
+                    for (k, _) in entries.into_iter().take(evict_count) {
+                        cache.remove(&k);
+                    }
+                }
+            }
+        }
+
+        involved
+    }
 }
 
 #[serenity::async_trait]
@@ -201,33 +272,63 @@ impl EventHandler for Handler {
             }
         }
 
-        let in_thread = if !in_allowed_channel {
+        // Thread detection: check if the message is in a thread whose parent
+        // is an allowed channel, and whether the bot owns that thread.
+        let (in_thread, bot_owns_thread) = if !in_allowed_channel {
             match msg.channel_id.to_channel(&ctx.http).await {
                 Ok(serenity::model::channel::Channel::Guild(gc)) => {
-                    let result = gc
+                    let parent_allowed = gc
                         .parent_id
                         .is_some_and(|pid| self.allowed_channels.contains(&pid.get()));
-                    tracing::debug!(channel_id = %msg.channel_id, parent_id = ?gc.parent_id, result, "thread check");
-                    result
+                    let owned = gc.owner_id.is_some_and(|oid| oid == bot_id);
+                    tracing::debug!(
+                        channel_id = %msg.channel_id,
+                        parent_id = ?gc.parent_id,
+                        owner_id = ?gc.owner_id,
+                        parent_allowed,
+                        bot_owns = owned,
+                        "thread check"
+                    );
+                    (parent_allowed, owned)
                 }
                 Ok(other) => {
                     tracing::debug!(channel_id = %msg.channel_id, kind = ?other, "not a guild channel");
-                    false
+                    (false, false)
                 }
                 Err(e) => {
                     tracing::debug!(channel_id = %msg.channel_id, error = %e, "to_channel failed");
-                    false
+                    (false, false)
                 }
             }
         } else {
-            false
+            (false, false)
         };
 
         if !in_allowed_channel && !in_thread {
             return;
         }
-        if !in_thread && !is_mentioned {
-            return;
+
+        // User message gating (mirrors Slack's AllowUsers logic).
+        // Mentions: always require @mention, even in bot's own threads.
+        // Involved (default): skip @mention if the bot owns the thread
+        //   (Option A) OR has previously posted in it (Option B).
+        if !is_mentioned {
+            match self.allow_user_messages {
+                AllowUsers::Mentions => return,
+                AllowUsers::Involved => {
+                    if !in_thread {
+                        return;
+                    }
+                    let involved = bot_owns_thread
+                        || self
+                            .bot_participated_in_thread(&ctx.http, msg.channel_id, bot_id)
+                            .await;
+                    if !involved {
+                        tracing::debug!(channel_id = %msg.channel_id, "bot not involved in thread, ignoring");
+                        return;
+                    }
+                }
+            }
         }
 
         if !self.allowed_users.is_empty() && !self.allowed_users.contains(&msg.author.id.get()) {
