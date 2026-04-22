@@ -71,7 +71,7 @@ impl ChatAdapter for DiscordAdapter {
     }
 
     fn use_streaming(&self) -> bool {
-        self.allow_bot_messages == AllowBots::Off
+        discord_should_stream(self.allow_bot_messages)
     }
 
     async fn create_thread(
@@ -898,6 +898,14 @@ fn resolve_mentions(content: &str, bot_id: UserId) -> String {
     // 3. Fallback: replace role mentions only (user mentions are preserved)
     let out = ROLE_MENTION_RE.replace_all(&out, "@(role)").to_string();
     out.trim().to_string()
+}
+
+/// Whether the Discord adapter should use streaming edit.
+/// Streaming is disabled when bots can post (Mentions/All) to avoid
+/// placeholder message interference in bot-to-bot threads.
+/// Mirrors the Slack adapter logic from commit 4eed3fc.
+fn discord_should_stream(allow_bot_messages: AllowBots) -> bool {
+    allow_bot_messages == AllowBots::Off
 }
 
 /// Pure thread detection: determines whether a channel is a Discord thread
