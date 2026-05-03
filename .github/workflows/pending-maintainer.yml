@@ -94,13 +94,19 @@ jobs:
                 issue_number: prNumber,
                 per_page: 100
               });
-              const humanComments = allComments.filter(c => !c.user.type || c.user.type !== 'Bot');
-              if (humanComments.length === 0) continue;
+              const EXCLUDED_BOTS = ['shaun-agent'];
+              const humanComments = allComments.filter(c =>
+                c.user.type !== 'Bot' && !EXCLUDED_BOTS.includes(c.user.login)
+              );
+              // If there are human comments, check who spoke last.
+              // Last comment by someone other than author = ball is with contributor, skip.
+              // No human comments = new PR awaiting first review, fall through.
+              if (humanComments.length > 0) {
+                const lastCommenter = humanComments[humanComments.length - 1].user.login;
+                if (lastCommenter !== pr.user.login) continue;
+              }
 
-              const lastCommenter = humanComments[humanComments.length - 1].user.login;
-              if (lastCommenter !== pr.user.login) continue;
-
-              // All conditions met: not draft, no conflicts, CI green, author replied
+              // All conditions met: not draft, no conflicts, CI green, awaiting maintainer
               if (!labels.includes(MAINTAINER)) {
                 await github.rest.issues.addLabels({
                   ...context.repo,
