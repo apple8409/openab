@@ -465,8 +465,11 @@ impl SessionPool {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_or_insert_gate, remove_if_same_handle};
+    use super::{get_or_insert_gate, remove_if_same_handle, SessionPool};
+    use crate::config::AgentConfig;
     use std::collections::HashMap;
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -503,5 +506,53 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(map.len(), 1);
+    }
+
+    #[cfg(unix)]
+    fn temp_working_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "openab-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).expect("create temp working dir");
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn health_check_surfaces_fast_fail_stderr() {
+        let working_dir = temp_working_dir("health-check");
+        let pool = SessionPool::new(
+            AgentConfig {
+                command: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "printf 'env: node: No such file or directory\\n' >&2; exit 1".into(),
+                ],
+                working_dir: working_dir
+                    .to_str()
+                    .expect("temp path should be utf-8")
+                    .to_string(),
+                env: HashMap::new(),
+                inherit_env: vec![],
+            },
+            1,
+        );
+
+        let err = pool
+            .health_check()
+            .await
+            .expect_err("health check should fail")
+            .to_string();
+
+        assert!(
+            err.contains("connection closed; agent stderr: env: node: No such file or directory")
+        );
+
+        let _ = fs::remove_dir_all(working_dir);
     }
 }
