@@ -550,7 +550,8 @@ mod tests {
             .to_string();
 
         assert!(
-            err.contains("connection closed; agent stderr: env: node: No such file or directory")
+            err.contains("connection closed; agent stderr: env: node: No such file or directory"),
+            "{err}"
         );
 
         let _ = fs::remove_dir_all(working_dir);
